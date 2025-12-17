@@ -1,6 +1,4 @@
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import httpx
 from bs4 import BeautifulSoup
 import sqlite3
 import os
@@ -9,50 +7,48 @@ import logging
 import random
 import threading
 import re
+import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, constants
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from telegram.error import TelegramError, Forbidden
 
 # --- KONFIGURACJA ---
-# Token pobierany ze zmiennych środowiskowych (bezpieczniej na Renderze)
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_TOKEN', '5571257868:AAF16UB9_niARzdsScPqwOxNHTDu_T-rSO0')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_TOKEN', '5571257868:AAGa4jQjpXOZ_CfsP6dsFdOb5l25LXS_qM4')
 
-# Lista monitorowanych adresów URL
 OLX_URLS = [
     'https://www.olx.pl/oddam-za-darmo/wroclaw/',
     'https://www.olx.pl/oddam-za-darmo/wroclaw/?search%5Bdist%5D=10&search%5Bfilter_float_price:from%5D=free'
 ]
 
-# Pliki
 DB_FILE = 'olx_bot.db'
 BLACKLIST_FILE = 'blacklist.txt'
 CHECK_INTERVAL = 300
-TIMEZONE_OFFSET = 1  # Czas Polski zimowy (UTC+1). Zmień na 2 latem.
+TIMEZONE_OFFSET = 1 
+
+# Generujemy ID sesji przy starcie - pomoże wykryć, czy działają dwie instancje
+SESSION_ID = str(uuid.uuid4())[:8]
 
 # Logowanie
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-for lib in ["httpx", "telegram", "urllib3"]:
+# Wyciszamy gadatliwe biblioteki
+for lib in ["httpx", "telegram", "httpcore"]:
     logging.getLogger(lib).setLevel(logging.WARNING)
 
-logger = logging.getLogger("OLX_Bot")
+logger = logging.getLogger(f"Bot-{SESSION_ID}")
 
+# --- USER AGENTS (Rotacja dla niepoznaki) ---
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+]
 
-# --- UTILS ---
-
-def get_pl_time():
-    """Zwraca aktualny czas w Polsce."""
-    utc = datetime.now(timezone.utc)
-    return utc + timedelta(hours=TIMEZONE_OFFSET)
-
-
-def get_pl_time_str():
-    return get_pl_time().strftime('%H:%M')
-
+# --- BAZA DANYCH & PLIKI ---
 
 def ensure_files():
     if not os.path.exists(BLACKLIST_FILE):
@@ -64,7 +60,6 @@ def ensure_files():
         with open(BLACKLIST_FILE, 'w', encoding='utf-8') as f:
             f.write('\n'.join(default_bl))
 
-
 def load_blacklist():
     ensure_files()
     try:
@@ -73,25 +68,94 @@ def load_blacklist():
     except:
         return []
 
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute('''CREATE TABLE IF NOT EXISTS offers (id TEXT PRIMARY KEY, title TEXT, created_at TIMESTAMP)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS stats (date TEXT PRIMARY KEY, count INTEGER)''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS subs (chat_id INTEGER PRIMARY KEY)''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"DB Init Error: {e}")
+
+# --- UTILS CZASOWE ---
+
+def get_pl_time():
+    utc = datetime.now(timezone.utc)
+    return utc + timedelta(hours=TIMEZONE_OFFSET)
+
+def get_pl_time_str():
+    return get_pl_time().strftime('%H:%M')
+
+# --- LOGIKA BAZODANOWA (Synchroniczna - SQLite jest szybki lokalnie) ---
+
+def is_seen(oid):
+    with sqlite3.connect(DB_FILE) as conn:
+        res = conn.execute("SELECT 1 FROM offers WHERE id = ?", (oid,)).fetchone()
+    return res is not None
+
+def save_offer(oid, title):
+    now = get_pl_time().isoformat()
+    today = get_pl_time().strftime('%Y-%m-%d')
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("INSERT OR IGNORE INTO offers (id, title, created_at) VALUES (?, ?, ?)", (oid, title, now))
+            conn.execute("INSERT OR IGNORE INTO stats (date, count) VALUES (?, 0)", (today,))
+            conn.execute("UPDATE stats SET count = count + 1 WHERE date = ?", (today,))
+            # Czyszczenie starych
+            conn.execute("DELETE FROM offers WHERE id NOT IN (SELECT id FROM offers ORDER BY created_at DESC LIMIT 2000)")
+            conn.commit()
+    except Exception as e:
+        logger.error(f"DB Save Error: {e}")
+
+def get_subs():
+    with sqlite3.connect(DB_FILE) as conn:
+        res = conn.execute("SELECT chat_id FROM subs").fetchall()
+    return {r[0] for r in res}
+
+def manage_sub(chat_id, action='add'):
+    with sqlite3.connect(DB_FILE) as conn:
+        if action == 'add':
+            conn.execute("INSERT OR IGNORE INTO subs (chat_id) VALUES (?)", (chat_id,))
+        else:
+            conn.execute("DELETE FROM subs WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+
+def get_stats_data():
+    today = get_pl_time().strftime('%Y-%m-%d')
+    with sqlite3.connect(DB_FILE) as conn:
+        today_cnt = conn.execute("SELECT count FROM stats WHERE date = ?", (today,)).fetchone()
+        total_cnt = conn.execute("SELECT SUM(count) FROM stats").fetchone()
+        subs_cnt = conn.execute("SELECT COUNT(*) FROM subs").fetchone()
+    
+    return {
+        'today': today_cnt[0] if today_cnt else 0,
+        'total': total_cnt[0] if total_cnt and total_cnt[0] else 0,
+        'subs': subs_cnt[0] if subs_cnt else 0
+    }
 
 # --- FILTRY ---
 
 def is_valid_offer(title):
     title_lower = title.lower()
     blacklist = load_blacklist()
-
-    found_banned = False
+    
+    # 1. Sprawdzenie Czarnej Listy
     for phrase in blacklist:
         if phrase in title_lower:
-            # Twardy ban dla żebraków
+            # "Twardy ban" dla słów typu "szukam", "kupię"
             if any(x in phrase for x in ['szu', 'prz', 'kup', 'potrzeb']):
                 return False
-            found_banned = True
-            break
-
-    if not found_banned:
+            # Dla innych słów (np. "kot") sprawdzamy, czy to nie akcesoria
+            # Ale jeśli znaleźliśmy słowo z blacklisty, domyślnie odrzucamy,
+            # chyba że znajdzie się na "Białej Liście" poniżej.
+            break 
+    else:
+        # Jeśli pętla skończyła się bez break (nie znaleziono bana), oferta jest OK
         return True
 
+    # 2. Biała Lista (Ratunkowa) - np. "Buda dla psa" (Pies zbanowany, ale buda OK)
     safe_words = [
         'dla', 'smycz', 'obroża', 'klatka', 'transporter', 'kuweta', 'karma',
         'żwirek', 'jedzenie', 'miska', 'ubranko', 'zabawka', 'drapak',
@@ -106,227 +170,121 @@ def is_valid_offer(title):
 
     return False
 
-
-# --- BAZA DANYCH ---
-
-def init_db():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        conn.execute('''CREATE TABLE IF NOT EXISTS offers (id TEXT PRIMARY KEY, title TEXT, created_at TIMESTAMP)''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS stats (date TEXT PRIMARY KEY, count INTEGER)''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS subs (chat_id INTEGER PRIMARY KEY)''')
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"DB Init Error: {e}")
-
-
-def is_seen(oid):
-    conn = sqlite3.connect(DB_FILE)
-    res = conn.execute("SELECT 1 FROM offers WHERE id = ?", (oid,)).fetchone()
-    conn.close()
-    return res is not None
-
-
-def save_offer(oid, title):
-    conn = sqlite3.connect(DB_FILE)
-    now = get_pl_time().isoformat()
-    today = get_pl_time().strftime('%Y-%m-%d')
-    try:
-        conn.execute("INSERT OR IGNORE INTO offers (id, title, created_at) VALUES (?, ?, ?)", (oid, title, now))
-        conn.execute("INSERT OR IGNORE INTO stats (date, count) VALUES (?, 0)", (today,))
-        conn.execute("UPDATE stats SET count = count + 1 WHERE date = ?", (today,))
-        conn.execute("DELETE FROM offers WHERE id NOT IN (SELECT id FROM offers ORDER BY created_at DESC LIMIT 2000)")
-        conn.commit()
-    except Exception:
-        pass
-    finally:
-        conn.close()
-
-
-def get_subs():
-    conn = sqlite3.connect(DB_FILE)
-    res = conn.execute("SELECT chat_id FROM subs").fetchall()
-    conn.close()
-    return {r[0] for r in res}
-
-
-def manage_sub(chat_id, action='add'):
-    conn = sqlite3.connect(DB_FILE)
-    if action == 'add':
-        conn.execute("INSERT OR IGNORE INTO subs (chat_id) VALUES (?)", (chat_id,))
-    else:
-        conn.execute("DELETE FROM subs WHERE chat_id = ?", (chat_id,))
-    conn.commit()
-    conn.close()
-
-
-def get_todays_count():
-    conn = sqlite3.connect(DB_FILE)
-    today = get_pl_time().strftime('%Y-%m-%d')
-    res = conn.execute("SELECT count FROM stats WHERE date = ?", (today,)).fetchone()
-    conn.close()
-    return res[0] if res else 0
-
-
-def get_total_count():
-    conn = sqlite3.connect(DB_FILE)
-    res = conn.execute("SELECT SUM(count) FROM stats").fetchone()
-    conn.close()
-    return res[0] if res and res[0] else 0
-
-
-# --- SILNIK SKANUJĄCY ---
-
-def get_session():
-    s = requests.Session()
-    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
-    s.mount('https://', HTTPAdapter(max_retries=retries))
-    return s
-
+# --- PARSING ---
 
 def clean_text(text):
     if not text: return ""
     return re.sub(r'\s+', ' ', text).strip()
 
-
-def parse_olx_date(raw_text):
-    if not raw_text: return "Brak danych", ""
-    if ' - ' in raw_text:
-        parts = raw_text.split(' - ')
-        return parts[0].strip(), parts[1].strip()
-    return raw_text, ""
-
-
 def validate_image_url(url):
-    """Naprawia i waliduje URL zdjęcia."""
     if not url: return None
     url = url.strip()
-    if url.startswith('//'):
-        url = 'https:' + url
-    if not url.startswith('http'):
-        return None
+    if url.startswith('//'): url = 'https:' + url
+    if not url.startswith('http'): return None
     return url
 
-
 def extract_offer_data(a_tag):
-    # 1. Znajdź kontener (kartę)
-    card = None
-    curr = a_tag
+    # Logika wyciągania danych z HTML
+    card = a_tag
+    # Szukamy rodzica będącego kartą ogłoszenia
     for _ in range(6):
-        if not curr.parent: break
-        curr = curr.parent
-        if curr.name == 'div':
-            if curr.find('img') or curr.find('p', attrs={'data-testid': 'location-date'}):
-                card = curr
-                if curr.get('data-testid') == 'l-card' or curr.get('data-cy') == 'l-card':
-                    break
-    if not card: card = a_tag.parent
-
-    # 2. Obrazek (z walidacją)
+        if not card.parent: break
+        card = card.parent
+        if card.name == 'div' and (card.get('data-testid') == 'l-card' or card.get('data-cy') == 'l-card'):
+            break
+            
+    # Obrazek
     img_src = None
     img = card.find('img')
     if img:
         src_set = img.get('srcset') or img.get('data-srcset')
         if src_set:
-            # Rozdzielamy srcset i bierzemy ostatni element (największy)
-            candidates = src_set.split(',')
-            best_candidate = candidates[-1].strip().split(' ')[0]
-            img_src = validate_image_url(best_candidate)
-
+            img_src = src_set.split(',')[-1].strip().split(' ')[0]
         if not img_src:
-            raw_src = img.get('src') or img.get('data-src')
-            img_src = validate_image_url(raw_src)
+            img_src = img.get('src') or img.get('data-src')
+    
+    img_src = validate_image_url(img_src)
 
-    # 3. Data
-    raw_date_loc = ""
+    # Data i lokalizacja
+    raw_info = ""
     date_p = card.find('p', attrs={'data-testid': 'location-date'})
     if date_p:
-        raw_date_loc = date_p.get_text(strip=True)
+        raw_info = date_p.get_text(strip=True)
+    
+    if ' - ' in raw_info:
+        parts = raw_info.split(' - ')
+        location, time_str = parts[0].strip(), parts[1].strip()
     else:
-        for p in card.find_all('p'):
-            txt = p.get_text(strip=True)
-            if ('Dzisiaj' in txt or 'Wczoraj' in txt) and ' - ' in txt:
-                raw_date_loc = txt
-                break
+        location, time_str = raw_info, ""
 
-    location, time_str = parse_olx_date(raw_date_loc)
+    return {'image': img_src, 'location': location, 'time': time_str}
 
-    return {
-        'image': img_src,
-        'location': location,
-        'time': time_str
-    }
-
+# --- ASYNC SCRAPING (HTTPX) ---
 
 async def fetch_olx_offers(pages=1):
-    session = get_session()
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-
+    headers = {'User-Agent': random.choice(USER_AGENTS)}
     offers = []
     seen_in_batch = set()
 
-    # Iteracja po wszystkich zdefiniowanych URL-ach
-    for base_url in OLX_URLS:
-        for page in range(1, pages + 1):
-            # Konstrukcja URL zależna od tego czy base_url ma już parametry
-            separator = '&' if '?' in base_url else '?'
-            url = f"{base_url}{separator}page={page}" if page > 1 else base_url
+    async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
+        for base_url in OLX_URLS:
+            for page in range(1, pages + 1):
+                separator = '&' if '?' in base_url else '?'
+                url = f"{base_url}{separator}page={page}" if page > 1 else base_url
+                
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        logger.warning(f"OLX zwrócił {resp.status_code} dla {url}")
+                        continue
 
-            try:
-                resp = session.get(url, headers=headers, timeout=10)
-                if resp.status_code != 200: continue
+                    soup = BeautifulSoup(resp.content, 'html.parser')
+                    links = soup.find_all('a', href=re.compile(r'/d/.*'))
 
-                soup = BeautifulSoup(resp.content, 'html.parser')
-                links = soup.find_all('a', href=re.compile(r'/d/.*'))
+                    for a in links:
+                        href = a['href']
+                        if any(x in href for x in ['otodom', 'fixly', 'promowane']): continue
 
-                for a in links:
-                    href = a['href']
-                    if any(x in href for x in ['otodom', 'fixly', 'promowane']): continue
+                        full_link = f"https://www.olx.pl{href}" if not href.startswith('http') else href
+                        
+                        # ID ogłoszenia
+                        try:
+                            oid = full_link.split('-ID')[-1].split('.')[0]
+                        except:
+                            oid = full_link[-10:]
 
-                    full_link = f"https://www.olx.pl{href}" if not href.startswith('http') else href
+                        if oid in seen_in_batch: continue
+                        seen_in_batch.add(oid)
 
-                    try:
-                        oid = full_link.split('-ID')[-1].split('.')[0]
-                    except:
-                        oid = full_link[-10:]
+                        # Tytuł
+                        title_tag = a.find(['h6', 'h4'])
+                        title = clean_text(title_tag.text) if title_tag else clean_text(a.text)
+                        
+                        # Walidacja "śmieci"
+                        if len(title) < 3 or "zł" in title or title == "Za darmo":
+                             if a.find('img') and a.find('img').get('alt'):
+                                 title = a.find('img').get('alt')
+                             else:
+                                 continue
 
-                    if oid in seen_in_batch: continue
-                    seen_in_batch.add(oid)
+                        details = extract_offer_data(a)
+                        
+                        offers.append({
+                            'id': oid,
+                            'title': title,
+                            'link': full_link,
+                            **details
+                        })
 
-                    title_tag = a.find(['h6', 'h4'])
-                    title = clean_text(title_tag.text) if title_tag else clean_text(a.text)
+                except Exception as e:
+                    logger.error(f"Błąd pobierania {url}: {e}")
+                    
+    return offers[::-1] # Od najstarszych do najnowszych
 
-                    if len(title) < 3 or "zł" in title or "Za darmo" == title:
-                        img = a.find('img')
-                        if img and img.get('alt'):
-                            title = img.get('alt')
-                        else:
-                            continue
-
-                    details = extract_offer_data(a)
-
-                    offers.append({
-                        'id': oid,
-                        'title': title,
-                        'link': full_link,
-                        **details
-                    })
-
-            except Exception as e:
-                logger.error(f"Err fetching {url}: {e}")
-                continue
-
-    return offers[::-1]
-
-
-# --- TELEGRAM ---
+# --- TELEGRAM SENDING ---
 
 async def send_offer(bot, chat_id, offer, prefix="🔥 <b>Nowa okazja!</b>"):
     time_display = offer['time'] if offer['time'] else "Świeże"
-
     caption = (
         f"{prefix}\n\n"
         f"📦 <b>{offer['title']}</b>\n"
@@ -335,149 +293,120 @@ async def send_offer(bot, chat_id, offer, prefix="🔥 <b>Nowa okazja!</b>"):
         f"➖➖➖➖➖➖➖\n"
         f"<i>Znaleziono: {get_pl_time_str()}</i>"
     )
-
-    kb = [[InlineKeyboardButton("🔗 Zobacz na OLX", url=offer['link'])]]
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Zobacz na OLX", url=offer['link'])]])
 
     try:
-        # PRÓBA WYSŁANIA ZDJĘCIA (3 PODEJŚCIA)
         if offer['image']:
-            for attempt in range(3):
-                try:
-                    await bot.send_photo(
-                        chat_id,
-                        offer['image'],
-                        caption=caption,
-                        parse_mode='HTML',
-                        reply_markup=InlineKeyboardMarkup(kb)
-                    )
-                    return  # Sukces!
-                except Exception as e:
-                    logger.warning(f"Foto {offer['id']} próba {attempt + 1}/3 nieudana: {e}")
-                    if attempt < 2:
-                        await asyncio.sleep(1)  # Odczekaj chwilę przed retry
+            try:
+                await bot.send_photo(chat_id, offer['image'], caption=caption, parse_mode='HTML', reply_markup=kb)
+                return
+            except Exception:
+                pass # Fallback do tekstu
 
-            logger.warning(f"Foto {offer['id']} - wszystkie próby nieudane. Wysyłam tekst.")
+        await bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=kb, disable_web_page_preview=False)
 
-        # FALLBACK TEKSTOWY
-        await bot.send_message(chat_id, f"📷 <i>(Zdjęcie niedostępne)</i>\n{caption}", parse_mode='HTML',
-                               reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=False)
-
-    except Forbidden:
-        manage_sub(chat_id, 'remove')
     except Exception as e:
-        logger.error(f"Critical Send Err: {e}")
+        logger.error(f"Nie udało się wysłać do {chat_id}: {e}")
+        # Jeśli użytkownik zablokował bota, usuwamy subskrypcję
+        if "Forbidden" in str(e):
+            manage_sub(chat_id, 'remove')
 
-
-# --- LOGIKA ---
+# --- LOGIKA BOTA ---
 
 async def check_cycle(bot, manual_chat_id=None, pages=1):
     offers = await fetch_olx_offers(pages=pages)
-
+    
     if manual_chat_id:
-        # MANUAL: Tylko podgląd, bez zapisu do bazy
         count = 0
         for o in offers:
             if not is_valid_offer(o['title']): continue
             if is_seen(o['id']): continue
-            await send_offer(bot, manual_chat_id, o, prefix="🔎 <b>Podgląd (Jeszcze nie wysłane):</b>")
+            await send_offer(bot, manual_chat_id, o, prefix="🔎 <b>Podgląd (Test):</b>")
             count += 1
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
         return count
     else:
-        # AUTOMAT: Do wszystkich + zapis
         subs = get_subs()
         if not subs: return 0
+        
         count = 0
         for o in offers:
             if is_seen(o['id']): continue
             if is_valid_offer(o['title']):
+                # Wysyłanie do wszystkich (asyncio.gather byłoby szybsze, ale pętla bezpieczniejsza dla limitów Telegrama)
                 for cid in subs:
                     await send_offer(bot, cid, o)
                 count += 1
             save_offer(o['id'], o['title'])
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5) # Krótka pauza między ofertami
+        
+        if count > 0:
+            logger.info(f"Znaleziono i wysłano {count} nowych ofert.")
         return count
 
+async def job_loop(ctx: ContextTypes.DEFAULT_TYPE):
+    await check_cycle(ctx.bot)
 
 # --- KOMENDY ---
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     manage_sub(update.effective_chat.id, 'add')
-    await update.message.reply_text("👋 <b>Bot aktywny.</b>", parse_mode='HTML')
-
+    await update.message.reply_text(f"👋 <b>Bot aktywny!</b>\nSesja serwera: <code>{SESSION_ID}</code>", parse_mode='HTML')
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_chat_action(update.effective_chat.id, constants.ChatAction.TYPING)
-    c = await check_cycle(ctx.bot, manual_chat_id=update.effective_chat.id, pages=1)
-    msg = f"✅ Znaleziono {c} nowych." if c > 0 else "💤 Brak nowości na 1. stronie."
+    c = await check_cycle(ctx.bot, manual_chat_id=update.effective_chat.id)
+    msg = f"✅ Znaleziono {c} nowych." if c > 0 else "💤 Brak nowości."
     await update.message.reply_text(msg)
 
-
-async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ctx.bot.send_chat_action(update.effective_chat.id, constants.ChatAction.TYPING)
-    await update.message.reply_text("📋 Sprawdzam historię (3 strony)...")
-    offers = await fetch_olx_offers(pages=3)
-    valid = [o for o in offers if is_valid_offer(o['title'])]
-    if not valid:
-        await update.message.reply_text("Pusto.")
-        return
-    for o in valid[-3:]:
-        await send_offer(ctx.bot, update.effective_chat.id, o, prefix="📂 <b>Z historii:</b>")
-        await asyncio.sleep(0.5)
-
-
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    today = get_todays_count()
-    total = get_total_count()
-    subs = len(get_subs())
+    s = get_stats_data()
     await update.message.reply_text(
-        f"📊 <b>Statystyki:</b>\n"
-        f"Dzisiaj: {today}\n"
-        f"Łącznie (cała historia): {total}\n"
-        f"Użytkowników: {subs}",
+        f"📊 <b>Statystyki (Sesja {SESSION_ID}):</b>\n"
+        f"Dziś znaleziono: {s['today']}\n"
+        f"Łącznie w bazie: {s['total']}\n"
+        f"Subskrybentów: {s['subs']}",
         parse_mode='HTML'
     )
 
-
-async def cmd_skipjob(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Ukryta komenda do wymuszenia natychmiastowego cyklu automatycznego."""
-    await update.message.reply_text("⏩ <b>Wymuszam Joba (Dla wszystkich)...</b>", parse_mode='HTML')
-    c = await check_cycle(ctx.bot, manual_chat_id=None, pages=1)  # pages=1 jak w automacie
-    await update.message.reply_text(f"✅ Job zakończony. Rozesłano {c} nowych ofert.")
-
-
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    txt = "⚙️ <b>Menu:</b>\n/sprawdz - podgląd nowych\n/lista - historia\n/stats\n/stop"
-    await update.message.reply_text(txt, parse_mode='HTML')
+    await update.message.reply_text(
+        "⚙️ <b>Menu:</b>\n/sprawdz - wymuś sprawdzenie\n/stats - statystyki\n/stop - wyłącz powiadomienia",
+        parse_mode='HTML'
+    )
 
-
-# --- START ---
-
-async def job_loop(ctx: ContextTypes.DEFAULT_TYPE):
-    await check_cycle(ctx.bot)
-
-
+# --- HEALTHCHECK (Dla Rendera) ---
 class Health(BaseHTTPRequestHandler):
-    def do_GET(s):
-        s.send_response(200);
-        s.wfile.write(b"OK")
-
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(f"Bot OK. Session: {SESSION_ID}".encode())
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
 if __name__ == '__main__':
     init_db()
     ensure_files()
-    threading.Thread(target=lambda: HTTPServer(('0.0.0.0', int(os.environ.get("PORT", 8080))), Health).serve_forever(),
-                     daemon=True).start()
+
+    # Serwer WWW w osobnym wątku
+    port = int(os.environ.get("PORT", 8080))
+    threading.Thread(
+        target=lambda: HTTPServer(('0.0.0.0', port), Health).serve_forever(),
+        daemon=True
+    ).start()
+
+    logger.info(f"--- START BOTA (Sesja: {SESSION_ID}) ---")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", lambda u, c: manage_sub(u.effective_chat.id, 'remove')))
     app.add_handler(CommandHandler("pomoc", cmd_help))
     app.add_handler(CommandHandler("sprawdz", cmd_check))
-    app.add_handler(CommandHandler("lista", cmd_list))
     app.add_handler(CommandHandler("stats", cmd_stats))
-    app.add_handler(CommandHandler("skipjob", cmd_skipjob))  # Ukryta komenda
 
-    app.job_queue.run_repeating(job_loop, interval=CHECK_INTERVAL, first=10)
-    print("Bot uruchomiony.")
-    app.run_polling()
+    if app.job_queue:
+        app.job_queue.run_repeating(job_loop, interval=CHECK_INTERVAL, first=10)
+    
+    app.run_polling(drop_pending_updates=True) # Ignoruje stare komendy przy starcie
