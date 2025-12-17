@@ -1,4 +1,6 @@
 python-telegram-bot[job-queue]>=21.4
 requests
 beautifulsoup4
+httpx
+fake-useragent
 
