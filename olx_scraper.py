@@ -1,4 +1,6 @@
-import httpx
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import sqlite3
 import os
@@ -14,7 +16,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, constan
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # --- KONFIGURACJA ---
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_TOKEN', '5571257868:AAGa4jQjpXOZ_CfsP6dsFdOb5l25LXS_qM4')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_TOKEN', '5571257868:AAF5ZYyKWj0W4YnFJoOsLxU_sji_8iUXMhg')
 
 OLX_URLS = [
     'https://www.olx.pl/oddam-za-darmo/wroclaw/',
@@ -26,7 +28,6 @@ BLACKLIST_FILE = 'blacklist.txt'
 CHECK_INTERVAL = 300
 TIMEZONE_OFFSET = 1 
 
-# Generujemy ID sesji przy starcie - pomoże wykryć, czy działają dwie instancje
 SESSION_ID = str(uuid.uuid4())[:8]
 
 # Logowanie
@@ -35,18 +36,28 @@ logging.basicConfig(
     level=logging.INFO
 )
 # Wyciszamy gadatliwe biblioteki
-for lib in ["httpx", "telegram", "httpcore"]:
+for lib in ["telegram", "urllib3", "requests"]:
     logging.getLogger(lib).setLevel(logging.WARNING)
 
 logger = logging.getLogger(f"Bot-{SESSION_ID}")
 
-# --- USER AGENTS (Rotacja dla niepoznaki) ---
+# --- USER AGENTS & HEADERS (Kluczowe dla ominięcia 403) ---
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0'
 ]
+
+def get_headers():
+    return {
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Referer': 'https://www.google.com/'
+    }
 
 # --- BAZA DANYCH & PLIKI ---
 
@@ -88,7 +99,7 @@ def get_pl_time():
 def get_pl_time_str():
     return get_pl_time().strftime('%H:%M')
 
-# --- LOGIKA BAZODANOWA (Synchroniczna - SQLite jest szybki lokalnie) ---
+# --- LOGIKA BAZODANOWA ---
 
 def is_seen(oid):
     with sqlite3.connect(DB_FILE) as conn:
@@ -103,7 +114,6 @@ def save_offer(oid, title):
             conn.execute("INSERT OR IGNORE INTO offers (id, title, created_at) VALUES (?, ?, ?)", (oid, title, now))
             conn.execute("INSERT OR IGNORE INTO stats (date, count) VALUES (?, 0)", (today,))
             conn.execute("UPDATE stats SET count = count + 1 WHERE date = ?", (today,))
-            # Czyszczenie starych
             conn.execute("DELETE FROM offers WHERE id NOT IN (SELECT id FROM offers ORDER BY created_at DESC LIMIT 2000)")
             conn.commit()
     except Exception as e:
@@ -141,21 +151,14 @@ def is_valid_offer(title):
     title_lower = title.lower()
     blacklist = load_blacklist()
     
-    # 1. Sprawdzenie Czarnej Listy
     for phrase in blacklist:
         if phrase in title_lower:
-            # "Twardy ban" dla słów typu "szukam", "kupię"
             if any(x in phrase for x in ['szu', 'prz', 'kup', 'potrzeb']):
                 return False
-            # Dla innych słów (np. "kot") sprawdzamy, czy to nie akcesoria
-            # Ale jeśli znaleźliśmy słowo z blacklisty, domyślnie odrzucamy,
-            # chyba że znajdzie się na "Białej Liście" poniżej.
             break 
     else:
-        # Jeśli pętla skończyła się bez break (nie znaleziono bana), oferta jest OK
         return True
 
-    # 2. Biała Lista (Ratunkowa) - np. "Buda dla psa" (Pies zbanowany, ale buda OK)
     safe_words = [
         'dla', 'smycz', 'obroża', 'klatka', 'transporter', 'kuweta', 'karma',
         'żwirek', 'jedzenie', 'miska', 'ubranko', 'zabawka', 'drapak',
@@ -184,16 +187,13 @@ def validate_image_url(url):
     return url
 
 def extract_offer_data(a_tag):
-    # Logika wyciągania danych z HTML
     card = a_tag
-    # Szukamy rodzica będącego kartą ogłoszenia
     for _ in range(6):
         if not card.parent: break
         card = card.parent
         if card.name == 'div' and (card.get('data-testid') == 'l-card' or card.get('data-cy') == 'l-card'):
             break
             
-    # Obrazek
     img_src = None
     img = card.find('img')
     if img:
@@ -205,7 +205,6 @@ def extract_offer_data(a_tag):
     
     img_src = validate_image_url(img_src)
 
-    # Data i lokalizacja
     raw_info = ""
     date_p = card.find('p', attrs={'data-testid': 'location-date'})
     if date_p:
@@ -219,67 +218,77 @@ def extract_offer_data(a_tag):
 
     return {'image': img_src, 'location': location, 'time': time_str}
 
-# --- ASYNC SCRAPING (HTTPX) ---
+# --- SYNCHRONICZNY SCRAPING (W WĄTKU) ---
 
-async def fetch_olx_offers(pages=1):
-    headers = {'User-Agent': random.choice(USER_AGENTS)}
+def fetch_offers_sync(pages=1):
+    """Funkcja synchroniczna używająca requests, uruchamiana w wątku."""
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    
     offers = []
     seen_in_batch = set()
 
-    async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
-        for base_url in OLX_URLS:
-            for page in range(1, pages + 1):
-                separator = '&' if '?' in base_url else '?'
-                url = f"{base_url}{separator}page={page}" if page > 1 else base_url
+    for base_url in OLX_URLS:
+        for page in range(1, pages + 1):
+            separator = '&' if '?' in base_url else '?'
+            url = f"{base_url}{separator}page={page}" if page > 1 else base_url
+            
+            try:
+                # Używamy bogatych nagłówków
+                resp = session.get(url, headers=get_headers(), timeout=10)
                 
-                try:
-                    resp = await client.get(url)
-                    if resp.status_code != 200:
-                        logger.warning(f"OLX zwrócił {resp.status_code} dla {url}")
-                        continue
+                if resp.status_code == 403:
+                    logger.warning(f"OLX 403 (Access Denied) dla {url} - Może być wymagana zmiana IP lub UserAgent")
+                    continue
+                if resp.status_code != 200:
+                    logger.warning(f"OLX zwrócił {resp.status_code} dla {url}")
+                    continue
 
-                    soup = BeautifulSoup(resp.content, 'html.parser')
-                    links = soup.find_all('a', href=re.compile(r'/d/.*'))
+                soup = BeautifulSoup(resp.content, 'html.parser')
+                links = soup.find_all('a', href=re.compile(r'/d/.*'))
 
-                    for a in links:
-                        href = a['href']
-                        if any(x in href for x in ['otodom', 'fixly', 'promowane']): continue
+                for a in links:
+                    href = a['href']
+                    if any(x in href for x in ['otodom', 'fixly', 'promowane']): continue
 
-                        full_link = f"https://www.olx.pl{href}" if not href.startswith('http') else href
-                        
-                        # ID ogłoszenia
-                        try:
-                            oid = full_link.split('-ID')[-1].split('.')[0]
-                        except:
-                            oid = full_link[-10:]
-
-                        if oid in seen_in_batch: continue
-                        seen_in_batch.add(oid)
-
-                        # Tytuł
-                        title_tag = a.find(['h6', 'h4'])
-                        title = clean_text(title_tag.text) if title_tag else clean_text(a.text)
-                        
-                        # Walidacja "śmieci"
-                        if len(title) < 3 or "zł" in title or title == "Za darmo":
-                             if a.find('img') and a.find('img').get('alt'):
-                                 title = a.find('img').get('alt')
-                             else:
-                                 continue
-
-                        details = extract_offer_data(a)
-                        
-                        offers.append({
-                            'id': oid,
-                            'title': title,
-                            'link': full_link,
-                            **details
-                        })
-
-                except Exception as e:
-                    logger.error(f"Błąd pobierania {url}: {e}")
+                    full_link = f"https://www.olx.pl{href}" if not href.startswith('http') else href
                     
-    return offers[::-1] # Od najstarszych do najnowszych
+                    try:
+                        oid = full_link.split('-ID')[-1].split('.')[0]
+                    except:
+                        oid = full_link[-10:]
+
+                    if oid in seen_in_batch: continue
+                    seen_in_batch.add(oid)
+
+                    title_tag = a.find(['h6', 'h4'])
+                    title = clean_text(title_tag.text) if title_tag else clean_text(a.text)
+                    
+                    if len(title) < 3 or "zł" in title or title == "Za darmo":
+                            if a.find('img') and a.find('img').get('alt'):
+                                title = a.find('img').get('alt')
+                            else:
+                                continue
+
+                    details = extract_offer_data(a)
+                    
+                    offers.append({
+                        'id': oid,
+                        'title': title,
+                        'link': full_link,
+                        **details
+                    })
+            except Exception as e:
+                logger.error(f"Błąd pobierania {url}: {e}")
+                
+    return offers[::-1]
+
+# --- ASYNC WRAPPER ---
+
+async def fetch_olx_offers(pages=1):
+    # Uruchomienie starego dobrego requests w osobnym wątku, żeby nie blokował bota
+    return await asyncio.to_thread(fetch_offers_sync, pages=pages)
 
 # --- TELEGRAM SENDING ---
 
@@ -301,13 +310,12 @@ async def send_offer(bot, chat_id, offer, prefix="🔥 <b>Nowa okazja!</b>"):
                 await bot.send_photo(chat_id, offer['image'], caption=caption, parse_mode='HTML', reply_markup=kb)
                 return
             except Exception:
-                pass # Fallback do tekstu
+                pass 
 
         await bot.send_message(chat_id, caption, parse_mode='HTML', reply_markup=kb, disable_web_page_preview=False)
 
     except Exception as e:
         logger.error(f"Nie udało się wysłać do {chat_id}: {e}")
-        # Jeśli użytkownik zablokował bota, usuwamy subskrypcję
         if "Forbidden" in str(e):
             manage_sub(chat_id, 'remove')
 
@@ -333,12 +341,11 @@ async def check_cycle(bot, manual_chat_id=None, pages=1):
         for o in offers:
             if is_seen(o['id']): continue
             if is_valid_offer(o['title']):
-                # Wysyłanie do wszystkich (asyncio.gather byłoby szybsze, ale pętla bezpieczniejsza dla limitów Telegrama)
                 for cid in subs:
                     await send_offer(bot, cid, o)
                 count += 1
             save_offer(o['id'], o['title'])
-            await asyncio.sleep(0.5) # Krótka pauza między ofertami
+            await asyncio.sleep(0.5)
         
         if count > 0:
             logger.info(f"Znaleziono i wysłano {count} nowych ofert.")
@@ -351,7 +358,7 @@ async def job_loop(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     manage_sub(update.effective_chat.id, 'add')
-    await update.message.reply_text(f"👋 <b>Bot aktywny!</b>\nSesja serwera: <code>{SESSION_ID}</code>", parse_mode='HTML')
+    await update.message.reply_text(f"👋 <b>Bot aktywny!</b>\nSesja: <code>{SESSION_ID}</code>", parse_mode='HTML')
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_chat_action(update.effective_chat.id, constants.ChatAction.TYPING)
@@ -375,7 +382,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML'
     )
 
-# --- HEALTHCHECK (Dla Rendera) ---
+# --- HEALTHCHECK ---
 class Health(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -389,7 +396,6 @@ if __name__ == '__main__':
     init_db()
     ensure_files()
 
-    # Serwer WWW w osobnym wątku
     port = int(os.environ.get("PORT", 8080))
     threading.Thread(
         target=lambda: HTTPServer(('0.0.0.0', port), Health).serve_forever(),
@@ -409,4 +415,4 @@ if __name__ == '__main__':
     if app.job_queue:
         app.job_queue.run_repeating(job_loop, interval=CHECK_INTERVAL, first=10)
     
-    app.run_polling(drop_pending_updates=True) # Ignoruje stare komendy przy starcie
+    app.run_polling(drop_pending_updates=True)
